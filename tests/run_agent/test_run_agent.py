@@ -6220,6 +6220,51 @@ class TestPersistUserMessageOverride:
         first_db_write = agent._session_db.append_message.call_args_list[0].kwargs
         assert first_db_write["content"] == "Hello there"
 
+    def test_override_preserves_multimodal_image_attachment(self, agent):
+        """A multimodal turn (text + image) keeps its image_url part when the
+        clean text override is applied.
+
+        Regression: the override replaced the whole content with the plain text
+        string, collapsing the multimodal list and dropping the image from the
+        live API call. Images sent to bound Telegram topics (which set a clean
+        persist override) were therefore never seen by the agent, while DMs
+        (no override) worked.
+        """
+        agent._persist_user_message_idx = 0
+        agent._persist_user_message_override = "do you see this"
+        agent._persist_user_message_timestamp = None
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "do you see this\n\n[Image attached at: /tmp/x.jpg]"},
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/AAAA"}},
+                ],
+            },
+        ]
+
+        agent._apply_persist_user_message_override(messages)
+
+        content = messages[0]["content"]
+        assert isinstance(content, list), "multimodal content must stay a list"
+        image_parts = [p for p in content if p.get("type") == "image_url"]
+        assert image_parts, "image_url part must be preserved for the model call"
+        assert image_parts[0]["image_url"]["url"].startswith("data:image/")
+        text_parts = [p for p in content if p.get("type") == "text"]
+        assert text_parts and text_parts[0]["text"] == "do you see this"
+
+    def test_override_on_text_only_message_unchanged(self, agent):
+        """Text-only override behavior is unchanged: the content is replaced
+        with the clean override string (the original transcript-cleaning case)."""
+        agent._persist_user_message_idx = 0
+        agent._persist_user_message_override = "real text"
+        agent._persist_user_message_timestamp = None
+        messages = [{"role": "user", "content": "[synthetic prefix] real text"}]
+
+        agent._apply_persist_user_message_override(messages)
+
+        assert messages[0]["content"] == "real text"
+
 
 class TestReasoningReplayForStrictProviders:
     """Assistant replay must preserve provider-native reasoning fields."""

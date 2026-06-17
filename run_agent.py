@@ -1484,7 +1484,24 @@ class AIAgent:
             msg = messages[idx]
             if isinstance(msg, dict) and msg.get("role") == "user":
                 if override is not None:
-                    msg["content"] = override
+                    cur = msg.get("content")
+                    if isinstance(cur, list):
+                        # Preserve attachment parts (image_url / input_audio) so a
+                        # multimodal turn still reaches the model. The clean text
+                        # override only replaces the text part; collapsing the whole
+                        # list to a string dropped the attachment from the live API
+                        # call, which is why images sent to bound topics were never
+                        # seen by the agent.
+                        attachments = [
+                            p for p in cur
+                            if isinstance(p, dict) and p.get("type") != "text"
+                        ]
+                        if attachments:
+                            msg["content"] = [{"type": "text", "text": override}] + attachments
+                        else:
+                            msg["content"] = override
+                    else:
+                        msg["content"] = override
                 if timestamp is not None:
                     msg["timestamp"] = timestamp
 
