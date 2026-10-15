@@ -453,6 +453,9 @@ def _synthesize_chunk_once(
 ) -> tuple:
     """One synthesis request for *chunk* into *chunk_path* -> ``(result, final_audio_path)``."""
     provider = single_kwargs["provider"]
+    # chunk_path never pre-exists (see _synthesize_chunks), so anything there is a previous attempt's
+    # clipped audio; a provider-reported path elsewhere is left to the caller's artifact sweep.
+    _remove_quietly(str(chunk_path))
     raw_result = _text_to_speech_single(chunk, str(chunk_path), **single_kwargs)
     try:
         chunk_result = json.loads(raw_result)

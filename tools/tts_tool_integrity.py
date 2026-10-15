@@ -12,13 +12,14 @@ chunk rather than delivering a clipped voice note.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import struct
 import subprocess
 from dataclasses import dataclass
 from typing import Any, BinaryIO, Callable, Optional
 
-from tools.tts_tool_delivery import _origin, _remove_quietly, _section, _sniff_audio_container
+from tools.tts_tool_delivery import _origin, _section, _sniff_audio_container
 
 logger = logging.getLogger("tools.tts_tool")
 
@@ -27,6 +28,10 @@ _OGG_PAGE_HEADER = struct.Struct("<4sBBqIIIB")
 _OGG_CAPTURE = b"OggS"
 _OGG_END_OF_STREAM = 0x04
 _OPUS_GRANULE_RATE = 48000  # Opus granule positions always count 48 kHz samples
+_OPUS_HEAD_MAGIC = b"OpusHead"
+_OPUS_HEAD_SIZE = 19  # identification header length (RFC 7845 section 5.1)
+_OPUS_PRE_SKIP = struct.Struct("<H")  # little-endian uint16 at byte 10 of the header
+_OPUS_PRE_SKIP_OFFSET = 10
 
 # Duration plausibility is checked only on text long enough for a clipped reply to be obvious,
 # against a deliberately fast speaking rate (typical speech is ~13-14 chars/s), and flags only
@@ -47,14 +52,15 @@ class _OggScan:
 class _OggWalk:
     end_of_stream: bool = False
     granule: int = -1
-    pre_skip: Optional[int] = None  # -1 once the first page shows the stream is not Opus
+    first_page_read: bool = False
+    opus_pre_skip: Optional[int] = None  # None when the first page is not an OpusHead
 
 
-def _opus_pre_skip(first_body: bytes) -> int:
-    """Pre-skip samples from an ``OpusHead`` packet, or -1 when the stream is not Opus."""
-    if first_body.startswith(b"OpusHead") and len(first_body) >= 12:
-        return struct.unpack_from("<H", first_body, 10)[0]
-    return -1
+def _opus_pre_skip(first_body: bytes) -> Optional[int]:
+    """Pre-skip samples from an ``OpusHead`` packet, or None when the stream is not Opus."""
+    if first_body.startswith(_OPUS_HEAD_MAGIC) and len(first_body) >= _OPUS_HEAD_SIZE:
+        return _OPUS_PRE_SKIP.unpack_from(first_body, _OPUS_PRE_SKIP_OFFSET)[0]
+    return None
 
 
 def _read_ogg_page(fh: BinaryIO, offset: int, size: int, walk: _OggWalk) -> Optional[int]:
@@ -72,8 +78,9 @@ def _read_ogg_page(fh: BinaryIO, offset: int, size: int, walk: _OggWalk) -> Opti
     end = offset + _OGG_PAGE_HEADER.size + segments + sum(lacing)
     if len(lacing) < segments or end > size:
         return size + 1
-    if walk.pre_skip is None:
-        walk.pre_skip = _opus_pre_skip(fh.read(min(sum(lacing), 19)))
+    if not walk.first_page_read:
+        walk.first_page_read = True
+        walk.opus_pre_skip = _opus_pre_skip(fh.read(min(sum(lacing), _OPUS_HEAD_SIZE)))
     if granule != -1:
         walk.granule = granule
     walk.end_of_stream = bool(header_type & _OGG_END_OF_STREAM)
@@ -87,7 +94,7 @@ def _scan_ogg(path: str) -> Optional[_OggScan]:
         size = os.path.getsize(path)
         walk, offset = _OggWalk(), 0
         with open(path, "rb") as fh:
-            while 0 <= offset < size:
+            while offset < size:
                 next_offset = _read_ogg_page(fh, offset, size, walk)
                 if next_offset is None:
                     return None
@@ -95,8 +102,8 @@ def _scan_ogg(path: str) -> Optional[_OggScan]:
     except OSError:
         return None
     duration = None
-    if walk.pre_skip is not None and walk.pre_skip >= 0 and walk.granule >= 0:
-        duration = max(0.0, (walk.granule - walk.pre_skip) / _OPUS_GRANULE_RATE)
+    if walk.opus_pre_skip is not None and walk.granule >= 0:
+        duration = max(0.0, (walk.granule - walk.opus_pre_skip) / _OPUS_GRANULE_RATE)
     complete = offset == size
     return _OggScan(complete=complete, end_of_stream=complete and walk.end_of_stream, duration=duration)
 
@@ -115,16 +122,17 @@ def _probe_duration(path: str) -> Optional[float]:
                             "packet=duration_time", "-of", "csv=p=0", path], timeout=30)
     except (OSError, subprocess.SubprocessError):
         return None
-    durations = [float(line) for line in probe.stdout.split() if _is_number(line)]
+    durations = [seconds for line in probe.stdout.split() if (seconds := _finite_seconds(line)) is not None]
     return sum(durations) if durations else None
 
 
-def _is_number(value: str) -> bool:
+def _finite_seconds(value: str) -> Optional[float]:
+    """A packet's ``duration_time`` as a finite float; None for ffprobe's ``N/A`` (unknown)."""
     try:
-        float(value)
+        seconds = float(value)
     except ValueError:
-        return False
-    return True
+        return None
+    return seconds if math.isfinite(seconds) else None
 
 
 def _speech_speed(tts_config: Any, provider: str) -> float:
@@ -177,7 +185,6 @@ def _synthesize_complete_chunk(
         return result, path
     logger.warning("TTS chunk %d from %s looks truncated (%s); retrying with a fresh request",
                    index, provider, problem)
-    _remove_quietly(path)  # a generated artifact: the retry must not find the clipped file in place
     result, path = synthesize()
     retry_problem = _audio_truncation_problem(path, text, tts_config, provider)
     if retry_problem is None:
